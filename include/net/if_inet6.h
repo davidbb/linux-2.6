@@ -182,6 +182,9 @@ struct inet6_dev {
 
 #ifdef CONFIG_IPV6_PRIVACY
 	u8			rndid[8];
+#ifdef CONFIG_IPV6_PRIVACY_HASH
+	__u32       rndid_inc;
+#endif
 	struct timer_list	regen_timer;
 	struct list_head	tempaddr_list;
 #endif

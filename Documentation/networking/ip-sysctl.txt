@@ -1186,11 +1186,18 @@ router_solicitations - INTEGER
 
 use_tempaddr - INTEGER
 	Preference for Privacy Extensions (RFC3041).
+    Bits 0 and 1:
 	  <= 0 : disable Privacy Extensions
 	  == 1 : enable Privacy Extensions, but prefer public
 	         addresses over temporary addresses.
-	  >  1 : enable Privacy Extensions and prefer temporary
+	  >= 2 : enable Privacy Extensions and prefer temporary
 	         addresses over public addresses.
+    Bit 2:
+	  == 0 : Use RFC3041 random algorithm for generating
+             temporary addresses.
+	  == 1 : Use the output of a hash based on the network prefix
+	         and random number from temp_random.
+
 	Default:  0 (for most devices)
 		 -1 (for point-to-point devices and loopback devices)
 
@@ -1201,6 +1208,17 @@ temp_valid_lft - INTEGER
 temp_prefered_lft - INTEGER
 	Preferred lifetime (in seconds) for temporary addresses.
 	Default: 86400 (1 day)
+
+temp_random - INTEGER[4]
+    Random number used as input to the hash function when
+	generating temporary addresses also based on the network
+    prefix.
+	 == 0 : Generate a new random value when a temporary address
+	        is created.  This random value replaces the 0 in
+			temp_random	
+      > 0 : A random number used as input to the hash
+
+	Default:  0
 
 max_desync_factor - INTEGER
 	Maximum value for DESYNC_FACTOR, which is a random value

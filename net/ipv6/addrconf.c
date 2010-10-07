@@ -122,6 +122,7 @@ static inline void addrconf_sysctl_unregister(struct inet6_dev *idev)
 #endif
 
 #ifdef CONFIG_IPV6_PRIVACY
+static int __ipv6_is_invalid_rndid(const __u8 * rndid);
 static int __ipv6_regen_rndid(struct inet6_dev *idev);
 static int __ipv6_try_regen_rndid(struct inet6_dev *idev, struct in6_addr *tmpaddr);
 static void ipv6_regen_rndid(unsigned long data);
@@ -181,6 +182,9 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.temp_prefered_lft	= TEMP_PREFERRED_LIFETIME,
 	.regen_max_retry	= REGEN_MAX_RETRY,
 	.max_desync_factor	= MAX_DESYNC_FACTOR,
+#ifdef CONFIG_IPV6_PRIVACY_HASH
+	.temp_random		= { 0, 0, 0, 0 },
+#endif
 #endif
 	.max_addresses		= IPV6_MAX_ADDRESSES,
 	.accept_ra_defrtr	= 1,
@@ -215,6 +219,9 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.temp_prefered_lft	= TEMP_PREFERRED_LIFETIME,
 	.regen_max_retry	= REGEN_MAX_RETRY,
 	.max_desync_factor	= MAX_DESYNC_FACTOR,
+#ifdef CONFIG_IPV6_PRIVACY_HASH
+	.temp_random		= { 0, 0, 0, 0 },
+#endif
 #endif
 	.max_addresses		= IPV6_MAX_ADDRESSES,
 	.accept_ra_defrtr	= 1,
@@ -837,6 +844,7 @@ static int ipv6_create_tempaddr(struct inet6_ifaddr *ifp, struct inet6_ifaddr *i
 		memcpy(&addr.s6_addr[8], &ift->addr.s6_addr[8], 8);
 		spin_unlock_bh(&ift->lock);
 		tmpaddr = &addr;
+		ift = NULL;
 	} else {
 		tmpaddr = NULL;
 	}
@@ -863,17 +871,71 @@ retry:
 	}
 	in6_ifa_hold(ifp);
 	memcpy(addr.s6_addr, ifp->addr.s6_addr, 8);
-	if (__ipv6_try_regen_rndid(idev, tmpaddr) < 0) {
-		spin_unlock_bh(&ifp->lock);
-		write_unlock(&idev->lock);
-		printk(KERN_WARNING
-			"ipv6_create_tempaddr(): regeneration of randomized interface id failed.\n");
-		in6_ifa_put(ifp);
-		in6_dev_put(idev);
-		ret = -1;
-		goto out;
+#ifdef CONFIG_IPV6_PRIVACY_HASH
+	while (idev->cnf.use_tempaddr > 4) {
+		char hash[32];
+		__u32 temp_random[4];
+		int i;
+
+		struct hash_desc desc = { .tfm = NULL, .flags = 0 };
+		struct scatterlist sg;
+
+		BUG_ON (sizeof(temp_random) != sizeof(idev->cnf.temp_random));
+
+		for (i = 0; unlikely(idev->cnf.temp_random[i] == 0) && i < 4; i++);
+		if (unlikely(i == 4))
+			get_random_bytes(idev->cnf.temp_random, sizeof(idev->cnf.temp_random));
+
+		desc.tfm = crypto_alloc_hash ("sha256", 0, CRYPTO_ALG_ASYNC);
+		if (IS_ERR(desc.tfm)) {
+			idev->cnf.use_tempaddr &= 0x03;
+			printk (KERN_WARNING
+					"ipv6_create_tempaddr(): Hash unavailable, reverting use_tempaddr to %d.\n",
+					idev->cnf.use_tempaddr);
+			break;
+		}
+
+		BUG_ON (crypto_hash_digestsize(desc.tfm) > sizeof(hash));
+		BUG_ON (sizeof(idev->rndid) < 8);
+
+		crypto_hash_init (&desc);
+
+		sg_init_one (&sg, (u8 *)addr.s6_addr, 8);
+		crypto_hash_update (&desc, &sg, 8);
+
+		memcpy (temp_random, idev->cnf.temp_random, sizeof(temp_random));
+		temp_random[3] += idev->rndid_inc;
+		sg_init_one (&sg, (u8 *)temp_random, sizeof(temp_random));
+		crypto_hash_update (&desc, &sg, sizeof(temp_random));
+
+		crypto_hash_final (&desc, hash);
+		crypto_free_hash (desc.tfm);
+
+		memcpy (&addr.s6_addr[8], hash, 8);
+		if (__ipv6_is_invalid_rndid(&addr.s6_addr[8])) {
+			idev->rndid_inc++;
+			continue;
+		}
+
+		ift = ipv6_get_ifaddr (dev_net(idev->dev), &addr, idev->dev, 0);
+		break;
 	}
-	memcpy(&addr.s6_addr[8], idev->rndid, 8);
+#else
+	idev->cnf.use_tempaddr &= 0x03;
+#endif
+	if (idev->cnf.use_tempaddr < 4) {
+		if (__ipv6_try_regen_rndid(idev, tmpaddr) < 0) {
+			spin_unlock_bh(&ifp->lock);
+			write_unlock(&idev->lock);
+			printk(KERN_WARNING
+				   "ipv6_create_tempaddr(): regeneration of randomized interface id failed.\n");
+			in6_ifa_put(ifp);
+			in6_dev_put(idev);
+			ret = -1;
+			goto out;
+		}
+		memcpy(&addr.s6_addr[8], idev->rndid, 8);
+	}
 	age = (jiffies - ifp->tstamp) / HZ;
 	tmp_valid_lft = min_t(__u32,
 			      ifp->valid_lft,
@@ -910,11 +972,11 @@ retry:
 	if (ifp->flags & IFA_F_OPTIMISTIC)
 		addr_flags |= IFA_F_OPTIMISTIC;
 
-	ift = !max_addresses ||
-	      ipv6_count_addresses(idev) < max_addresses ?
-		ipv6_add_addr(idev, &addr, tmp_plen,
-			      ipv6_addr_type(&addr)&IPV6_ADDR_SCOPE_MASK,
-			      addr_flags) : NULL;
+	if (!ift && (!max_addresses || ipv6_count_addresses(idev) < max_addresses)) {
+		ift = ipv6_add_addr(idev, &addr, tmp_plen,
+		                    ipv6_addr_type(&addr)&IPV6_ADDR_SCOPE_MASK,
+		                    addr_flags);
+	}
 	if (!ift || IS_ERR(ift)) {
 		in6_ifa_put(ifp);
 		in6_dev_put(idev);
@@ -931,9 +993,11 @@ retry:
 	ift->prefered_lft = tmp_prefered_lft;
 	ift->cstamp = tmp_cstamp;
 	ift->tstamp = tmp_tstamp;
+	ift->regen_count = 0;
 	spin_unlock_bh(&ift->lock);
 
-	addrconf_dad_start(ift, 0);
+	if (ift->flags & IFA_F_TENTATIVE)
+		addrconf_dad_start(ift, 0);
 	in6_ifa_put(ift);
 	in6_dev_put(idev);
 out:
@@ -1078,7 +1142,7 @@ static int ipv6_get_saddr_eval(struct net *net,
 		 */
 		int preftmp = dst->prefs & (IPV6_PREFER_SRC_PUBLIC|IPV6_PREFER_SRC_TMP) ?
 				!!(dst->prefs & IPV6_PREFER_SRC_TMP) :
-				score->ifa->idev->cnf.use_tempaddr >= 2;
+				!!(score->ifa->idev->cnf.use_tempaddr & 2);
 		ret = (!(score->ifa->flags & IFA_F_TEMPORARY)) ^ preftmp;
 		break;
 	    }
@@ -1386,6 +1450,9 @@ static void addrconf_dad_stop(struct inet6_ifaddr *ifp, int dad_failed)
 		if (ifpub) {
 			in6_ifa_hold(ifpub);
 			spin_unlock_bh(&ifp->lock);
+#ifdef CONFIG_IPV6_PRIVACY_HASH
+			ifp->idev->rndid_inc++;
+#endif
 			ipv6_create_tempaddr(ifpub, ifp);
 			in6_ifa_put(ifpub);
 		} else {
@@ -1594,13 +1661,8 @@ static int ipv6_inherit_eui64(u8 *eui, struct inet6_dev *idev)
 }
 
 #ifdef CONFIG_IPV6_PRIVACY
-/* (re)generation of randomized interface identifier (RFC 3041 3.2, 3.5) */
-static int __ipv6_regen_rndid(struct inet6_dev *idev)
+static int __ipv6_is_invalid_rndid(const __u8 * rndid)
 {
-regen:
-	get_random_bytes(idev->rndid, sizeof(idev->rndid));
-	idev->rndid[0] &= ~0x02;
-
 	/*
 	 * <draft-ietf-ipngwg-temp-addresses-v2-00.txt>:
 	 * check if generated address is not inappropriate
@@ -1612,15 +1674,35 @@ regen:
 	 *  - value 0
 	 *  - XXX: already assigned to an address on the device
 	 */
-	if (idev->rndid[0] == 0xfd &&
-	    (idev->rndid[1]&idev->rndid[2]&idev->rndid[3]&idev->rndid[4]&idev->rndid[5]&idev->rndid[6]) == 0xff &&
-	    (idev->rndid[7]&0x80))
-		goto regen;
-	if ((idev->rndid[0]|idev->rndid[1]) == 0) {
-		if (idev->rndid[2] == 0x5e && idev->rndid[3] == 0xfe)
-			goto regen;
-		if ((idev->rndid[2]|idev->rndid[3]|idev->rndid[4]|idev->rndid[5]|idev->rndid[6]|idev->rndid[7]) == 0x00)
-			goto regen;
+
+	if (rndid[0] == 0xfd &&
+	    (rndid[1]&rndid[2]&rndid[3]&rndid[4]&rndid[5]&rndid[6]) == 0xff &&
+	    (rndid[7]&0x80))
+		return -1;
+	if ((rndid[0]|rndid[1]) == 0) {
+		if (rndid[2] == 0x5e && rndid[3] == 0xfe)
+			return -1;
+		if ((rndid[2]|rndid[3]|rndid[4]|rndid[5]|rndid[6]|rndid[7]) == 0x00)
+			return -1;
+	}
+	return 0;
+}
+
+/* (re)generation of randomized interface identifier (RFC 3041 3.2, 3.5) */
+static int __ipv6_regen_rndid(struct inet6_dev *idev)
+{
+#ifdef CONFIG_IPV6_PRIVACY_HASH
+	if (idev->cnf.use_tempaddr > 4) {
+		get_random_bytes(idev->cnf.temp_random, sizeof(idev->cnf.temp_random));
+	}
+#else
+	idev->cnf.use_tempaddr &= 0x03;
+#endif
+	if (idev->cnf.use_tempaddr < 4) {
+		do {
+			get_random_bytes(idev->rndid, sizeof(idev->rndid));
+			idev->rndid[0] &= ~0x02;
+		} while (__ipv6_is_invalid_rndid(idev->rndid));
 	}
 
 	return 0;
@@ -1891,6 +1973,10 @@ ok:
 		if (ifp == NULL && valid_lft) {
 			int max_addresses = in6_dev->cnf.max_addresses;
 			u32 addr_flags = 0;
+
+#ifdef CONFIG_IPV6_PRIVACY_HASH
+			in6_dev->rndid_inc = 0;
+#endif
 
 #ifdef CONFIG_IPV6_OPTIMISTIC_DAD
 			if (in6_dev->cnf.optimistic_dad &&
@@ -4458,6 +4544,15 @@ static struct addrconf_sysctl_table
 			.mode           = 0644,
 			.proc_handler   = proc_dointvec
 		},
+#ifdef CONFIG_IPV6_PRIVACY_HASH
+		{
+			.procname	= "temp_random",
+			.data		= &ipv6_devconf.temp_random,
+			.maxlen		= sizeof(ipv6_devconf.temp_random),
+			.mode		= 0640,
+			.proc_handler	= proc_dointvec,
+		},
+#endif
 		{
 			/* sentinel */
 		}

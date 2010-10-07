@@ -39,6 +39,28 @@ config IPV6_PRIVACY
 
 	  See <file:Documentation/networking/ip-sysctl.txt> for details.
 
+if IPV6_PRIVACY
+
+config IPV6_PRIVACY_HASH
+	bool "IPv6: Privacy Extension Hash Support"
+	select CRYPTO
+	select CRYPTO_SHA256
+	---help---
+	  Generate the pseudo-random global-scope unicast address(es) based on
+	  the output of hashing together the broadcast prefix with a random
+	  value.  The algorithm is discussed in Volume 36, Number 1 of the USENIX
+	  ;Login: publication.
+
+	  To use hash-based temorary addresses, do
+
+	         echo 6 >/proc/sys/net/ipv6/conf/all/use_tempaddr
+
+	  To modify the input to the hash, do
+
+	         echo <random> >/proc/sys/net/ipv6/conf/all/temp_random
+
+endif # if IPV6_PRIVACY
+
 config IPV6_ROUTER_PREF
 	bool "IPv6: Router Preference (RFC 4191) support"
 	---help---
